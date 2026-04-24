@@ -1,0 +1,215 @@
+import os, time, math, warnings
+import numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+from sklearn.feature_selection import chi2, mutual_info_classif
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# 1. LOAD DATASET
+# =========================================================
+# Ensure the CSV is in the same directory as your script, or provide the full path
+df = pd.read_csv("E:\sample test  data\Mental Health Dataset.csv")
+print("Original shape:", df.shape)
+
+# CHANGE THIS if your target column has a different name
+TARGET = "treatment" 
+
+# =========================================================
+# 2. CLEAN USELESS / LEAKAGE COLUMNS
+# =========================================================
+# Drop generic identifiers or free-text columns that don't help prediction
+drop_cols = ["Timestamp", "comments", "s.no", "id"] 
+drop_cols += [c for c in df.columns if "Unnamed" in c]
+
+df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
+
+# Drop rows where the target is missing
+df.dropna(subset=[TARGET], inplace=True)
+
+# Convert text target (e.g., "Yes"/"No") to numeric (1/0)
+le = LabelEncoder()
+df[TARGET] = le.fit_transform(df[TARGET])
+
+print("After cleaning:", df.shape)
+
+X = df.drop(columns=[TARGET])
+y = df[TARGET]
+
+# =========================================================
+# 3. FEATURE TYPES
+# =========================================================
+numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+categorical_features = [c for c in X.columns if c not in numeric_features]
+
+print("Numeric:", len(numeric_features), "| Categorical:", len(categorical_features))
+
+# =========================================================
+# 4. PREPROCESSING (Chi² safe)
+# =========================================================
+numeric_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", MinMaxScaler())
+])
+
+categorical_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_transformer, numeric_features),
+    ("cat", categorical_transformer, categorical_features)
+])
+
+X_proc = preprocessor.fit_transform(X)
+print("Processed shape:", X_proc.shape)
+
+# =========================================================
+# 5. FEATURE SELECTION (CHI² + MI)
+# =========================================================
+chi_scores, _ = chi2(X_proc, y)
+mi_scores = mutual_info_classif(X_proc, y, random_state=42)
+
+chi_norm = chi_scores / (chi_scores.max() + 1e-9)
+mi_norm = mi_scores / (mi_scores.max() + 1e-9)
+
+combined = chi_norm + mi_norm
+TOP_K = min(40, X_proc.shape[1])
+top_idx = np.argsort(combined)[-TOP_K:]
+
+X_sel = X_proc[:, top_idx]
+print("Selected features:", TOP_K)
+
+# =========================================================
+# 6. TRAIN TEST SPLIT
+# =========================================================
+X_train, X_test, y_train, y_test = train_test_split(
+    X_sel, y, test_size=0.25, random_state=42, stratify=y
+)
+
+# =========================================================
+# 7. PCA (ONLY FOR DISTANCE)
+# =========================================================
+pca = PCA(n_components=0.95, random_state=42)
+X_train_pca = pca.fit_transform(X_train)
+X_test_pca = pca.transform(X_test)
+
+plt.plot(np.cumsum(pca.explained_variance_ratio_))
+plt.title("PCA Explained Variance")
+plt.xlabel("Components")
+plt.ylabel("Cumulative Variance")
+plt.show()
+
+# =========================================================
+# 8. DISTANCE BASED REDUCTION
+# =========================================================
+distances = ["euclidean", "manhattan", "cosine"]
+results = []
+roc_data = {}
+
+Q = 0.8
+R = 0.4
+
+for metric in distances:
+    print("\n---", metric.upper(), "---")
+
+    nn = NearestNeighbors(n_neighbors=6, metric=metric)
+    nn.fit(X_train_pca)
+    dists, _ = nn.kneighbors(X_train_pca)
+
+    compactness = dists[:, 1:].mean(axis=1)
+    threshold = np.quantile(compactness, Q)
+
+    dense = np.where(compactness <= threshold)[0]
+    sparse = np.where(compactness > threshold)[0]
+
+    if len(dense) > 50:
+        k = max(2, int(math.sqrt(len(dense) / 2)))
+        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels = km.fit_predict(X_train_pca[dense])
+
+        d2c = np.linalg.norm(
+            X_train_pca[dense] - km.cluster_centers_[labels], axis=1
+        )
+
+        cutoff = np.quantile(d2c, 1 - R)
+        keep_dense = dense[d2c >= cutoff]
+        keep_idx = np.concatenate([sparse, keep_dense])
+    else:
+        keep_idx = np.arange(len(X_train))
+
+    print("Reduced:", len(keep_idx), "/", len(X_train))
+
+    clf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
+
+    t0 = time.time()
+    # y_train is a numpy array now because of LabelEncoder, handle indexing:
+    if isinstance(y_train, pd.Series):
+        y_train_subset = y_train.iloc[keep_idx]
+    else:
+        y_train_subset = y_train[keep_idx]
+        
+    clf.fit(X_train[keep_idx], y_train_subset)
+    train_time = time.time() - t0
+
+    y_pred = clf.predict(X_test)
+    y_prob = clf.predict_proba(X_test)[:, 1]
+
+    acc = accuracy_score(y_test, y_pred)
+    auc = roc_auc_score(y_test, y_prob)
+
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    roc_data[metric] = (fpr, tpr, auc)
+
+    results.append({
+        "Distance": metric,
+        "Samples": len(keep_idx),
+        "Accuracy": acc,
+        "ROC_AUC": auc,
+        "Train_Time": train_time
+    })
+
+# =========================================================
+# 9. RESULTS
+# =========================================================
+res_df = pd.DataFrame(results)
+print(res_df)
+
+# ROC plot
+plt.figure(figsize=(7,5))
+for m, (fpr, tpr, auc) in roc_data.items():
+    plt.plot(fpr, tpr, label=f"{m} (AUC={auc:.3f})")
+plt.plot([0,1],[0,1],'k--')
+plt.legend()
+plt.title("ROC Curves - Mental Health Dataset")
+plt.show()
+
+# Accuracy Bar Chart
+plt.figure(figsize=(6,4))
+plt.bar(res_df["Distance"], res_df["Accuracy"])
+plt.title("Accuracy by Distance Metric")
+plt.xlabel("Distance Metric")
+plt.ylabel("Accuracy")
+plt.show()
+
+# Training Time Bar Chart
+plt.figure(figsize=(6,4))
+plt.bar(res_df["Distance"], res_df["Train_Time"])
+plt.title("Training Time by Distance Metric")
+plt.xlabel("Distance Metric")
+plt.ylabel("Seconds")
+plt.show()
