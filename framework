@@ -1,215 +1,227 @@
-import os, time, math, warnings
+
+import math, time, warnings
 import numpy as np, pandas as pd
 import matplotlib.pyplot as plt
-
+from matplotlib.ticker import PercentFormatter
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-
 from sklearn.feature_selection import chi2, mutual_info_classif
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from sklearn.cluster import KMeans
-
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
-
+from sklearn.metrics import accuracy_score, roc_auc_score
 warnings.filterwarnings("ignore")
 
-# =========================================================
-# 1. LOAD DATASET
-# =========================================================
-# Ensure the CSV is in the same directory as your script, or provide the full path
-df = pd.read_csv("E:\sample test  data\Mental Health Dataset.csv")
-print("Original shape:", df.shape)
 
-# CHANGE THIS if your target column has a different name
-TARGET = "treatment" 
+CSV_PATH    = r"E:\sample test  data\Mental Health Dataset.csv"   
+SAMPLE_N    = None            
+METRICS     = ["euclidean", "manhattan", "cosine"]
+OUT_CSV     = "dedup_results.csv"
+PLOT_PREFIX = "reduction"     
+SHOW_PLOTS  = True
+# ---------------------------------------------------------------------------
+SEED, Q, R, TOP_K, N_TIMING_RUNS = 42, 0.8, 0.4, 40, 3
+TARGET = "treatment"
 
-# =========================================================
-# 2. CLEAN USELESS / LEAKAGE COLUMNS
-# =========================================================
-# Drop generic identifiers or free-text columns that don't help prediction
-drop_cols = ["Timestamp", "comments", "s.no", "id"] 
-drop_cols += [c for c in df.columns if "Unnamed" in c]
 
-df.drop(columns=[c for c in drop_cols if c in df.columns], inplace=True)
+def banner(t):
+    print("\n" + "=" * 78 + f"\n{t}\n" + "=" * 78, flush=True)
 
-# Drop rows where the target is missing
-df.dropna(subset=[TARGET], inplace=True)
 
-# Convert text target (e.g., "Yes"/"No") to numeric (1/0)
-le = LabelEncoder()
-df[TARGET] = le.fit_transform(df[TARGET])
+# ============================ 1. DATA + PIPELINE ============================
+banner("1. DATA AND PREPROCESSING (all fitted on the training split only)")
+df = pd.read_csv(CSV_PATH).drop(columns=["Timestamp"]).dropna(subset=[TARGET])
+df[TARGET] = LabelEncoder().fit_transform(df[TARGET])
+if SAMPLE_N:
+    df, _ = train_test_split(df, train_size=SAMPLE_N, stratify=df[TARGET], random_state=SEED)
+X_raw, y = df.drop(columns=[TARGET]), df[TARGET].values
+Xtr_raw, Xte_raw, y_train, y_test = train_test_split(
+    X_raw, y, test_size=0.25, random_state=SEED, stratify=y)
 
-print("After cleaning:", df.shape)
+pre = ColumnTransformer([("c", Pipeline([
+    ("i", SimpleImputer(strategy="most_frequent")),
+    ("o", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), X_raw.columns.tolist())])
+Xtr, Xte = pre.fit_transform(Xtr_raw), pre.transform(Xte_raw)
 
-X = df.drop(columns=[TARGET])
-y = df[TARGET]
+chi, _ = chi2(Xtr, y_train)
+mi = mutual_info_classif(Xtr, y_train, discrete_features=True, random_state=SEED)
+top = np.argsort(np.nan_to_num(chi / (chi.max() + 1e-9)) + mi / (mi.max() + 1e-9))[-TOP_K:]
+X_train, X_test = Xtr[:, top].astype(np.float32), Xte[:, top].astype(np.float32)
 
-# =========================================================
-# 3. FEATURE TYPES
-# =========================================================
-numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
-categorical_features = [c for c in X.columns if c not in numeric_features]
+pca = PCA(n_components=0.95, random_state=SEED)
+Xp = pca.fit_transform(X_train)
 
-print("Numeric:", len(numeric_features), "| Categorical:", len(categorical_features))
+# group identical feature rows, keeping a per-class count for each pattern
+U, first_idx, inv = np.unique(X_train, axis=0, return_index=True, return_inverse=True)
+inv = inv.ravel(); G = len(U)
+cnt = np.zeros((G, 2)); np.add.at(cnt, (inv, y_train), 1)
+Up = Xp[first_idx]
+print(f"Total rows used            : {len(df):,}")
+print(f"Train / test rows          : {len(X_train):,} / {len(X_test):,}")
+print(f"Features after selection   : {X_train.shape[1]} (of {Xtr.shape[1]})")
+print(f"PCA components (95% var.)  : {Xp.shape[1]}")
+print(f"Distinct feature patterns  : {G:,} ({100 * G / len(X_train):.2f}% of training rows)")
 
-# =========================================================
-# 4. PREPROCESSING (Chi² safe)
-# =========================================================
-numeric_transformer = Pipeline([
-    ("imputer", SimpleImputer(strategy="median")),
-    ("scaler", MinMaxScaler())
-])
 
-categorical_transformer = Pipeline([
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-])
+# ============================ 2. HELPERS ====================================
+def fit_rf(Xa, ya, w=None):
+    clf = RandomForestClassifier(n_estimators=200, random_state=SEED, n_jobs=-1)
+    times = []
+    for _ in range(N_TIMING_RUNS):
+        t = time.perf_counter(); clf.fit(Xa, ya, sample_weight=w); times.append(time.perf_counter() - t)
+    return clf, float(np.median(times))
 
-preprocessor = ColumnTransformer([
-    ("num", numeric_transformer, numeric_features),
-    ("cat", categorical_transformer, categorical_features)
-])
+def score(clf):
+    return (float(accuracy_score(y_test, clf.predict(X_test))),
+            float(roc_auc_score(y_test, clf.predict_proba(X_test)[:, 1])))
 
-X_proc = preprocessor.fit_transform(X)
-print("Processed shape:", X_proc.shape)
+def expand(groups):
+    """Training rows (pattern, label, weight) for the chosen patterns."""
+    g0, g1 = groups[cnt[groups, 0] > 0], groups[cnt[groups, 1] > 0]
+    Xr = np.vstack([U[g0], U[g1]])
+    yr = np.r_[np.zeros(len(g0)), np.ones(len(g1))].astype(int)
+    return Xr, yr, np.r_[cnt[g0, 0], cnt[g1, 1]]
 
-# =========================================================
-# 5. FEATURE SELECTION (CHI² + MI)
-# =========================================================
-chi_scores, _ = chi2(X_proc, y)
-mi_scores = mutual_info_classif(X_proc, y, random_state=42)
+rows = []
+def add(group, metric, n, acc, auc, t):
+    rows.append(dict(Group=group, Metric=metric, Rows=int(n), Accuracy=acc, ROC_AUC=auc, Time=t))
+    label = f"{group}" + (f" [{metric}]" if metric else "")
+    print(f"  {label:<38} rows={n:>8,}  acc={acc*100:5.1f}%  auc={auc:.3f}  time={t:5.2f}s", flush=True)
 
-chi_norm = chi_scores / (chi_scores.max() + 1e-9)
-mi_norm = mi_scores / (mi_scores.max() + 1e-9)
 
-combined = chi_norm + mi_norm
-TOP_K = min(40, X_proc.shape[1])
-top_idx = np.argsort(combined)[-TOP_K:]
+# ============================ 3. EXPERIMENTS ================================
+banner("2. RUNNING EXPERIMENTS")
+clf, t_full = fit_rf(X_train, y_train);  add("All rows (baseline)", "", len(X_train), *score(clf), t_full)
+Xa, ya, wa = expand(np.arange(G));       clf, t = fit_rf(Xa, ya, wa); add("Dedup + weights", "", len(Xa), *score(clf), t)
 
-X_sel = X_proc[:, top_idx]
-print("Selected features:", TOP_K)
+rng = np.random.RandomState(SEED)
+keep_by_metric = {}
+for m in METRICS:
+    nn = NearestNeighbors(n_neighbors=min(6, G), metric=m, n_jobs=-1).fit(Up)
+    d, _ = nn.kneighbors(Up)
+    comp = d[:, 1:].mean(axis=1)
+    thr = np.quantile(comp, Q)
+    dense, sparse = np.where(comp <= thr)[0], np.where(comp > thr)[0]
+    km = KMeans(n_clusters=max(2, int(math.sqrt(len(dense) / 2))), random_state=SEED, n_init="auto")
+    km.fit(Up[dense], sample_weight=cnt[dense].sum(1))
+    d2c = np.linalg.norm(Up[dense] - km.cluster_centers_[km.labels_], axis=1)
+    keep = np.concatenate([sparse, dense[d2c >= np.quantile(d2c, 1 - R)]])
+    keep_by_metric[m] = keep
 
-# =========================================================
-# 6. TRAIN TEST SPLIT
-# =========================================================
-X_train, X_test, y_train, y_test = train_test_split(
-    X_sel, y, test_size=0.25, random_state=42, stratify=y
-)
+    Xr, yr, wr = expand(keep); clf, t = fit_rf(Xr, yr, wr)
+    add("Density rule", m, len(Xr), *score(clf), t)
 
-# =========================================================
-# 7. PCA (ONLY FOR DISTANCE)
-# =========================================================
-pca = PCA(n_components=0.95, random_state=42)
-X_train_pca = pca.fit_transform(X_train)
-X_test_pca = pca.transform(X_test)
+    A, U_, T = [], [], []
+    for _ in range(3):
+        Xs, ys, ws = expand(rng.choice(G, size=len(keep), replace=False))
+        c, tt = fit_rf(Xs, ys, ws); a, u = score(c); A.append(a); U_.append(u); T.append(tt)
+    add("Random unique patterns", m, len(Xs), float(np.mean(A)), float(np.mean(U_)), float(np.median(T)))
 
-plt.plot(np.cumsum(pca.explained_variance_ratio_))
-plt.title("PCA Explained Variance")
-plt.xlabel("Components")
-plt.ylabel("Cumulative Variance")
-plt.show()
+    A, U_, T = [], [], []
+    for _ in range(3):
+        idx = rng.choice(len(X_train), size=len(Xr), replace=False)
+        c, tt = fit_rf(X_train[idx], y_train[idx]); a, u = score(c); A.append(a); U_.append(u); T.append(tt)
+    add("Random raw rows", m, len(Xr), float(np.mean(A)), float(np.mean(U_)), float(np.median(T)))
 
-# =========================================================
-# 8. DISTANCE BASED REDUCTION
-# =========================================================
-distances = ["euclidean", "manhattan", "cosine"]
-results = []
-roc_data = {}
+res = pd.DataFrame(rows)
+full, dedup = res.iloc[0], res.iloc[1]
+res["dAcc_pts"] = 100 * (res.Accuracy - full.Accuracy)
+res["dTime_pct"] = 100 * (res.Time / full.Time - 1)
+full, dedup = res.iloc[0], res.iloc[1]      # re-read so they include the delta columns
+res.to_csv(OUT_CSV, index=False)
 
-Q = 0.8
-R = 0.4
 
-for metric in distances:
-    print("\n---", metric.upper(), "---")
+# ============================ 4. READABLE REPORT ============================
+banner("3. RESULTS TABLE")
+show = res.copy()
+show["Method"] = show.apply(lambda r: r.Group + (f" [{r.Metric}]" if r.Metric else ""), axis=1)
+show = pd.DataFrame({
+    "Method": show.Method,
+    "Rows used": show.Rows.map("{:,}".format),
+    "Accuracy": (show.Accuracy * 100).map("{:.1f}%".format),
+    "ROC-AUC": show.ROC_AUC.map("{:.3f}".format),
+    "Train time": show.Time.map("{:.2f}s".format),
+    "Acc vs all rows": show.dAcc_pts.map("{:+.1f} pts".format),
+    "Time vs all rows": show.dTime_pct.map("{:+.0f}%".format)})
+print(show.to_string(index=False))
 
-    nn = NearestNeighbors(n_neighbors=6, metric=metric)
-    nn.fit(X_train_pca)
-    dists, _ = nn.kneighbors(X_train_pca)
+banner("4. KEY TAKEAWAYS")
+print(f"- {len(X_train):,} training rows collapse to {G:,} distinct patterns ({int(dedup.Rows):,} weighted rows).")
+print(f"- Dedup + weights: accuracy {full.Accuracy*100:.1f}% -> {dedup.Accuracy*100:.1f}% "
+      f"({dedup.dAcc_pts:+.1f} pts), training time {dedup.dTime_pct:+.0f}%.")
+for m in METRICS:
+    dr = res[(res.Group == "Density rule") & (res.Metric == m)].iloc[0]
+    ru = res[(res.Group == "Random unique patterns") & (res.Metric == m)].iloc[0]
+    verdict = "BETTER" if dr.Accuracy > ru.Accuracy else "WORSE"
+    print(f"- Density rule [{m}] is {verdict} than random pattern selection by "
+          f"{abs(dr.Accuracy - ru.Accuracy)*100:.1f} pts (THIS SPLIT ONLY).")
+print("- Caution: a single split is noisy. In a 6-split check the Euclidean/Manhattan gaps varied by about "
+      "+/-4 pts and flipped sign; only cosine was consistent (+1.8 pts). Change random_state to test.")
 
-    compactness = dists[:, 1:].mean(axis=1)
-    threshold = np.quantile(compactness, Q)
 
-    dense = np.where(compactness <= threshold)[0]
-    sparse = np.where(compactness > threshold)[0]
+# ============================ 5. CHARTS =====================================
+BLUE, GREY, ORANGE, GREEN = "#2a6fdb", "#9aa5b1", "#e07b39", "#2f9e5b"
+series = {"Density rule": BLUE, "Random unique patterns": GREY, "Random raw rows": ORANGE}
+plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "font.size": 10})
 
-    if len(dense) > 50:
-        k = max(2, int(math.sqrt(len(dense) / 2)))
-        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
-        labels = km.fit_predict(X_train_pca[dense])
+def grouped(ax, col, title, as_pct):
+    x, w = np.arange(len(METRICS)), 0.26
+    allv = []
+    for i, (g, c) in enumerate(series.items()):
+        vals = [res[(res.Group == g) & (res.Metric == m)][col].iloc[0] for m in METRICS]
+        allv += vals
+        bars = ax.bar(x + (i - 1) * w, vals, w, label=g, color=c)
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2, v, f"{v*100:.1f}" if as_pct else f"{v:.2f}",
+                    ha="center", va="bottom", fontsize=8)
+    ax.axhline(full[col], ls="--", color="black", lw=1, label="All rows (baseline)")
+    ax.axhline(dedup[col], ls=":", color=GREEN, lw=2, label="Dedup + weights")
+    lo, hi = min(allv + [full[col], dedup[col]]), max(allv + [full[col], dedup[col]])
+    ax.set_ylim(max(0, lo - 0.08), min(1.0, hi + 0.05))
+    ax.set_xticks(x); ax.set_xticklabels([m.title() for m in METRICS])
+    ax.set_title(title, fontweight="bold", loc="left")
+    if as_pct: ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
 
-        d2c = np.linalg.norm(
-            X_train_pca[dense] - km.cluster_centers_[labels], axis=1
-        )
+fig, ax = plt.subplots(2, 2, figsize=(13, 9))
+grouped(ax[0, 0], "Accuracy", "Test accuracy (higher is better)", True)
+grouped(ax[0, 1], "ROC_AUC", "ROC-AUC (higher is better)", False)
+handles, labels = ax[0, 0].get_legend_handles_labels()
 
-        cutoff = np.quantile(d2c, 1 - R)
-        keep_dense = dense[d2c >= cutoff]
-        keep_idx = np.concatenate([sparse, keep_dense])
-    else:
-        keep_idx = np.arange(len(X_train))
+dens = res[res.Group == "Density rule"]
+names = ["All rows", "Dedup + weights", "Density rule\n(avg of metrics)"]
+times = [full.Time, dedup.Time, dens.Time.mean()]
+nrows = [full.Rows, dedup.Rows, dens.Rows.mean()]
+for a, vals, title, fmt in [(ax[1, 0], times, "Random Forest training time (seconds)", "{:.2f}s"),
+                            (ax[1, 1], nrows, "Rows fed to the model (log scale)", "{:,.0f}")]:
+    bars = a.bar(names, vals, color=["#444444", GREEN, BLUE])
+    for b, v in zip(bars, vals):
+        a.text(b.get_x() + b.get_width() / 2, v, fmt.format(v), ha="center", va="bottom", fontweight="bold")
+    a.set_title(title, fontweight="bold", loc="left")
+ax[1, 1].set_yscale("log"); ax[1, 1].set_ylim(top=max(nrows) * 4)
+ax[1, 0].set_ylim(top=max(times) * 1.15)
+fig.suptitle("Training-set reduction: what each method costs and saves", fontsize=14, fontweight="bold")
+fig.tight_layout(rect=[0, 0.05, 1, 0.96])
+fig.legend(handles, labels, loc="lower center", ncol=5, fontsize=9, frameon=False)
+fig.savefig(f"{PLOT_PREFIX}_summary.png", dpi=150, bbox_inches="tight")
 
-    print("Reduced:", len(keep_idx), "/", len(X_train))
+fig2, axs = plt.subplots(1, len(METRICS), figsize=(5 * len(METRICS), 4.6), sharex=True, sharey=True)
+axs = np.atleast_1d(axs)
+size = 25 + 220 * np.log1p(cnt.sum(1)) / np.log1p(cnt.sum(1).max())
+for a, m in zip(axs, METRICS):
+    kept = np.zeros(G, bool); kept[keep_by_metric[m]] = True
+    a.scatter(Up[~kept, 0], Up[~kept, 1], s=size[~kept], c="#d5d9df", edgecolor="#555", lw=0.4, label=f"Dropped ({(~kept).sum()})")
+    a.scatter(Up[kept, 0], Up[kept, 1], s=size[kept], c=BLUE, edgecolor="white", lw=0.5, alpha=0.9, label=f"Kept ({kept.sum()})")
+    a.set_title(m.title(), fontweight="bold"); a.set_xlabel("PCA component 1"); a.legend(fontsize=8)
+axs[0].set_ylabel("PCA component 2")
+fig2.suptitle("Which patterns the density rule kept (dot size = number of survey rows with that pattern)",
+              fontsize=12, fontweight="bold")
+fig2.tight_layout(rect=[0, 0, 1, 0.93])
+fig2.savefig(f"{PLOT_PREFIX}_patterns.png", dpi=150, bbox_inches="tight")
 
-    clf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
-
-    t0 = time.time()
-    # y_train is a numpy array now because of LabelEncoder, handle indexing:
-    if isinstance(y_train, pd.Series):
-        y_train_subset = y_train.iloc[keep_idx]
-    else:
-        y_train_subset = y_train[keep_idx]
-        
-    clf.fit(X_train[keep_idx], y_train_subset)
-    train_time = time.time() - t0
-
-    y_pred = clf.predict(X_test)
-    y_prob = clf.predict_proba(X_test)[:, 1]
-
-    acc = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_prob)
-
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
-    roc_data[metric] = (fpr, tpr, auc)
-
-    results.append({
-        "Distance": metric,
-        "Samples": len(keep_idx),
-        "Accuracy": acc,
-        "ROC_AUC": auc,
-        "Train_Time": train_time
-    })
-
-# =========================================================
-# 9. RESULTS
-# =========================================================
-res_df = pd.DataFrame(results)
-print(res_df)
-
-# ROC plot
-plt.figure(figsize=(7,5))
-for m, (fpr, tpr, auc) in roc_data.items():
-    plt.plot(fpr, tpr, label=f"{m} (AUC={auc:.3f})")
-plt.plot([0,1],[0,1],'k--')
-plt.legend()
-plt.title("ROC Curves - Mental Health Dataset")
-plt.show()
-
-# Accuracy Bar Chart
-plt.figure(figsize=(6,4))
-plt.bar(res_df["Distance"], res_df["Accuracy"])
-plt.title("Accuracy by Distance Metric")
-plt.xlabel("Distance Metric")
-plt.ylabel("Accuracy")
-plt.show()
-
-# Training Time Bar Chart
-plt.figure(figsize=(6,4))
-plt.bar(res_df["Distance"], res_df["Train_Time"])
-plt.title("Training Time by Distance Metric")
-plt.xlabel("Distance Metric")
-plt.ylabel("Seconds")
-plt.show()
+if SHOW_PLOTS:
+    plt.show()
+print(f"\nSaved: {OUT_CSV}, {PLOT_PREFIX}_summary.png, {PLOT_PREFIX}_patterns.png")
